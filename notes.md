@@ -1,16 +1,106 @@
 ```
+def streaming_restore(status, session=None):
+|__ status.run_restore_ops(session=session)
+    // any restore operations are run by this `new_restore_ops_callback`
+    status._checkpoint.new_restore_ops_callback = (lambda ops: session.run(ops, feed_dict=status._feed_dict))
+
+class _CheckpointRestoreCoordinator
+|__ __init__
+    |__ self.restore_ops = []
+        self.restore_ops_by_name = {}
+        self.new_restore_ops_callback = None
+        
+|__ new_restore_ops(self, new_ops):
+    self.restore_ops.extend(new_ops)
+    if self.new_restore_ops_callback:
+    |__ self.new_restore_ops_callback(new_ops)
+
+class _CheckpointPosition
+|__ restore
+    |__ restore_ops = checkpointable._restore_from_checkpoint_position(self)
+        self._checkpoint.new_restore_ops(restore_ops)
+
+CheckpointableSaver(Object)
+|__ restore
+    |__ checkpoint = _CheckpointRestoreCoordinator(object_graph_proto=object_graph_proto,
+                                                    save_path=file_prefix_tensor,
+                                                    dtype_map=dtype_map)
+        base._CheckpointPosition(checkpoint=checkpoint, proto_id=0).restore(self._root_checkpointable)
+        load_status = CheckpointLoadStatus(checkpoint, root_checkpointable=self._root_checkpointable, feed_dict=file_prefix_feed_dict)
+
+Checkpointable(base.CheckpointableBase)
+
+Checkpoint(tracking.Checkpointable)
+|__ __init__
+    |__ self._saver = CheckpointableSaver(weakref.ref(self))
+
+------------------------------------------------------------------------------------------------------------------------
+
+CheckpointableDataStructure(base.CheckpointableBase)
+|__ 
+
+List(CheckpointableDataStructure, collections.Sequence)
+|__
+
+_ListWrapper(List, collections.MutableSequence, list)
+
+Mapping(CheckpointableDataStructure, collections.Mapping)
+
+_DictWrapper(Mapping, collections.MutableMapping)
+
+------------------------------------------------------------------------------------------------------------------------
+
 tensorflow/python/training/checkpointable/base.py
-CheckpointableBase
+CheckpointableBase(Object)
 |__ _maybe_initialize_checkpointable
     |__ self._unconditional_checkpoint_dependencies = []
-
-|__ _track_checkpointable
-    // self._unconditional_checkpoint_dependencies is modified here
-    |__ self._unconditional_checkpoint_dependencies[index] = new_reference
+        // used to handle deferred dependencies
+        self._unconditional_deferred_dependencies = {}
 
 |__ _add_variable_with_custom_getter
-    |__ self._track_checkpointable(new_variable, name=name, overwrite=overwrite)
+    // new variable is created with a custom `getter`
+    |__ new_variable = getter(name=name, shape=shape, dtype=dtype, initializer=initializer, **kwargs_for_getter)
+        // then track this newly created variable as checkpoint dependency
+        self._track_checkpointable(new_variable, name=name, overwrite=overwrite)
 
+|__ _track_checkpointable
+    |__ current_object = self._lookup_dependency(name)
+    // if denpendency if found, then if must be a layer, not variable, since variable has not be created, at this time
+    // add the layer to the dependency of this `tf.keras.Model`
+    |__ if current_object is not None
+        // self._unconditional_checkpoint_dependencies is modified here
+        |__ self._unconditional_checkpoint_dependencies[index] = new_reference
+    // if it is None, then is must be a variable, handle deferred dependencies
+    |__ elif current_object is None:
+        |__ self._handle_deferred_dependencies(name=name, checkpointable=checkpointable)
+    
+|__ _handle_deferred_dependencies
+    |__ deferred_dependencies_list = self._deferred_dependencies.pop(name, ())
+    |__ for checkpoint_position in sorted(deferred_dependencies_list, 
+                                          key=lambda restore: restore.checkpoint.restore_uid,
+                                          reverse=True):
+        // at this time, _CheckpointPosition.restore is called, then restored
+        |__ checkpoint_position.restore(checkpointable)
+        
+|__ _restore_from_checkpoint_position
+    |__ visit_queue = collections.deque([checkpoint_position])
+        restore_ops = []
+    |__ while visit_queue:
+        current_position = visit_queue.popleft()
+        restore_ops.extend(nest.flatten(current_position.checkpointable._single_restoration_from_checkpoint_position(
+                                          checkpoint_position=current_position,
+                                          visit_queue=visit_queue)))
+                                          
+|__ _single_restoration_from_checkpoint_position
+    |__ for child in checkpoint_position.object_proto.children:
+        |__ child_position = _CheckpointPosition(checkpoint=checkpoint, proto_id=child.node_id)
+            local_object = self._lookup_dependency(child.local_name)
+        |__ if local_object is None:
+            |__ self._deferred_dependencies.setdefault(child.local_name, []).append(child_position)
+        |__ else:
+            |__ if child_position.bind_object(checkpointable=local_object):
+                visit_queue.append(child_position)
+                
 ------------------------------------------------------------------------------------------------------------------------
 
 tensorflow/python/keras/engine/base_layer.py
@@ -24,6 +114,7 @@ Layer(CheckpointableBase)
     // call _add_variable_with_custom_getter to create variable, note that this will add the created variable to the
     // checkpoint dependency of this layer
     |__ _add_variable_with_custom_getter
+        |__ self._track_checkpointable(new_variable, name=name, overwrite=overwrite)
     // later append created variable to self._trainable_weights or self._non_trainable_weights according to whether it
     // trainable.
     // 
@@ -119,7 +210,7 @@ Network(Layer)
                 // used for collecting variables that are directly assigned as attributes with constructor
                 self._extra_variables = []
                 
-            // a saver is set
+            // a saver is set, used for save/restore
             |__ self._checkpointable_saver = checkpointable_utils.CheckpointableSaver(weakref.ref(self))
             // Runs restore operations when graph building. (only applicable to subclassed Models)
             |__ self._in_progress_restore_finalizer = None
@@ -447,7 +538,7 @@ tf.keras.Model
                         |__ outs = f(ins)
                     // if OutOfRangeError, tell users dataset is out of data
                     |__ except errors.OutOfRangeError:
-------------------------------------------------------------------------------------------------------------------------    
+------------------------------------------------------------------------------------------------------------------------  
 tensorflow/python/keras/engine/training_arrays.py
 fit_loop
 // call Model._make_train_function() to build Model.train_function
